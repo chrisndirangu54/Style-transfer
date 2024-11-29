@@ -116,14 +116,14 @@ def warp_frame_with_flow(frame, flow):
     warped = cv2.remap(frame, flow_map, None, cv2.INTER_LINEAR)
     return warped
 
-def video_style_transfer(input_video, output_video, style_prompt, device='cuda'):
+def video_style_transfer(input_video, output_video, style_prompt, device='cuda', batch_size=8):
     # Load models
     generator = StyleTransferGenerator().to(device)
     generator.load_state_dict(torch.load("generator.pth"))  # Load pretrained generator
     clip_encoder = CLIPStyleEncoder(device)
     temporal_consistency = ConvLSTM(input_dim=64, hidden_dim=64, kernel_size=3, num_layers=1, batch_first=True).to(device)
 
-    # Initialize video writer
+    # Initialize video reader and writer
     cap = cv2.VideoCapture(input_video)
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -133,38 +133,53 @@ def video_style_transfer(input_video, output_video, style_prompt, device='cuda')
 
     # Encode style prompt
     style_embedding = clip_encoder.encode_style_prompt(style_prompt)
-    
-    hidden_state = None  # Initialize hidden state for LSTM
-    prev_frame = None
-    prev_output = None
 
-    for _ in tqdm(range(total_frames), desc="Processing Video"):
+    hidden_state = None  # Initialize hidden state for LSTM
+    prev_frames = []
+    prev_outputs = []
+
+    frames_batch = []
+    for frame_idx in tqdm(range(total_frames), desc="Processing Video"):
         ret, frame = cap.read()
         if not ret:
             break
 
         frame_tensor = transforms.ToTensor()(frame).unsqueeze(0).to(device)
-        generated_frame = generator(frame_tensor, style_embedding)
+        frames_batch.append(frame_tensor)
 
-        # Pass the encoded frame through ConvLSTM for temporal consistency
-        encoded_frame = generator.encoder(frame_tensor)
-        lstm_output, hidden_state = temporal_consistency(encoded_frame, hidden_state)
+        # Process in batches
+        if len(frames_batch) == batch_size or frame_idx == total_frames - 1:
+            frames_batch = torch.cat(frames_batch, dim=0)
+            generated_frames = []
 
-        if prev_frame is not None:
-            flow = compute_optical_flow(prev_frame, frame)
-            warped_prev_output = warp_frame_with_flow(prev_output, flow)
+            for i in range(frames_batch.size(0)):
+                frame_tensor = frames_batch[i].unsqueeze(0)
+                generated_frame = generator(frame_tensor, style_embedding)
 
-            # Blend outputs: ConvLSTM, optical flow, and current frame
-            # This is a placeholder for blending logic; refine as needed
-            consistency_loss = F.mse_loss(lstm_output, warped_prev_output)
-            generated_frame = (1 - consistency_loss) * generated_frame + consistency_loss * warped_prev_output
+                # Pass the encoded frame through ConvLSTM for temporal consistency
+                encoded_frame = generator.encoder(frame_tensor)
+                lstm_output, hidden_state = temporal_consistency(encoded_frame, hidden_state)
 
-        prev_frame = frame
-        prev_output = generated_frame.squeeze(0).cpu().numpy().transpose(1, 2, 0)
-        generated_frame = generated_frame.squeeze(0).cpu().numpy().transpose(1, 2, 0)
-        generated_frame = (generated_frame * 255).astype(np.uint8)
-        
-        out.write(cv2.cvtColor(generated_frame, cv2.COLOR_RGB2BGR))
+                if prev_frames:
+                    flow = compute_optical_flow(prev_frames[-1], frame)
+                    warped_prev_output = warp_frame_with_flow(prev_outputs[-1], flow)
+
+                    # Blend outputs: ConvLSTM, optical flow, and current frame
+                    consistency_loss = F.mse_loss(lstm_output, warped_prev_output)
+                    generated_frame = (1 - consistency_loss) * generated_frame + consistency_loss * warped_prev_output
+
+                prev_frames.append(frame)
+                prev_outputs.append(generated_frame)
+
+                generated_frames.append(generated_frame.squeeze(0))
+
+            # Save batch to video
+            for gen_frame in generated_frames:
+                gen_frame = gen_frame.cpu().numpy().transpose(1, 2, 0)
+                gen_frame = (gen_frame * 255).astype(np.uint8)
+                out.write(cv2.cvtColor(gen_frame, cv2.COLOR_RGB2BGR))
+
+            frames_batch = []
 
     cap.release()
     out.release()
