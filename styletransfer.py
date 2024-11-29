@@ -44,15 +44,21 @@ class CLIPStyleEncoder:
         return text_features / text_features.norm(dim=-1, keepdim=True)
 
 # Learned Temporal Consistency Mechanism (ConvLSTM)
-class TemporalConsistencyConvLSTM(nn.Module):
-    def __init__(self, input_dim=3, hidden_dim=64, kernel_size=(3, 3)):
-        super(TemporalConsistencyConvLSTM, self).__init__()
-        self.convlstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
-        self.conv = nn.Conv2d(hidden_dim, input_dim, kernel_size=1)
+class ConvLSTM(nn.Module):
+    def __init__(self, input_dim, hidden_dim, kernel_size, num_layers, batch_first=True):
+        super(ConvLSTM, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=batch_first)
+        self.conv = nn.Conv2d(hidden_dim, hidden_dim, kernel_size, padding=kernel_size // 2)
 
     def forward(self, x, hidden_state=None):
-        x, hidden_state = self.convlstm(x, hidden_state)
+        batch_size, channels, height, width = x.size()
+        x = x.view(batch_size, channels, -1)  # Flatten spatial dims for LSTM
+        x, hidden_state = self.lstm(x, hidden_state)
+        x = x.view(batch_size, self.hidden_dim, height, width)  # Reshape to spatial dims
         return self.conv(x), hidden_state
+
 
 # Generator Network with AdaIN
 class StyleTransferGenerator(nn.Module):
@@ -110,26 +116,27 @@ def warp_frame_with_flow(frame, flow):
     warped = cv2.remap(frame, flow_map, None, cv2.INTER_LINEAR)
     return warped
 
-# Main Video Style Transfer Pipeline
 def video_style_transfer(input_video, output_video, style_prompt, device='cuda'):
     # Load models
     generator = StyleTransferGenerator().to(device)
     generator.load_state_dict(torch.load("generator.pth"))  # Load pretrained generator
     clip_encoder = CLIPStyleEncoder(device)
-    temporal_consistency = TemporalConsistencyConvLSTM()
+    temporal_consistency = ConvLSTM(input_dim=64, hidden_dim=64, kernel_size=3, num_layers=1, batch_first=True).to(device)
 
-    # Encode style prompt
-    style_embedding = clip_encoder.encode_style_prompt(style_prompt)
-
-    # Video processing
+    # Initialize video writer
     cap = cv2.VideoCapture(input_video)
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
     out = cv2.VideoWriter(output_video, cv2.VideoWriter_fourcc(*'mp4v'), fps, (frame_width, frame_height))
-    hidden_state = None
+
+    # Encode style prompt
+    style_embedding = clip_encoder.encode_style_prompt(style_prompt)
+    
+    hidden_state = None  # Initialize hidden state for LSTM
+    prev_frame = None
+    prev_output = None
 
     for _ in tqdm(range(total_frames), desc="Processing Video"):
         ret, frame = cap.read()
@@ -139,11 +146,24 @@ def video_style_transfer(input_video, output_video, style_prompt, device='cuda')
         frame_tensor = transforms.ToTensor()(frame).unsqueeze(0).to(device)
         generated_frame = generator(frame_tensor, style_embedding)
 
-        # Apply temporal consistency
-        generated_frame, hidden_state = temporal_consistency(generated_frame, hidden_state)
+        # Pass the encoded frame through ConvLSTM for temporal consistency
+        encoded_frame = generator.encoder(frame_tensor)
+        lstm_output, hidden_state = temporal_consistency(encoded_frame, hidden_state)
 
+        if prev_frame is not None:
+            flow = compute_optical_flow(prev_frame, frame)
+            warped_prev_output = warp_frame_with_flow(prev_output, flow)
+
+            # Blend outputs: ConvLSTM, optical flow, and current frame
+            # This is a placeholder for blending logic; refine as needed
+            consistency_loss = F.mse_loss(lstm_output, warped_prev_output)
+            generated_frame = (1 - consistency_loss) * generated_frame + consistency_loss * warped_prev_output
+
+        prev_frame = frame
+        prev_output = generated_frame.squeeze(0).cpu().numpy().transpose(1, 2, 0)
         generated_frame = generated_frame.squeeze(0).cpu().numpy().transpose(1, 2, 0)
         generated_frame = (generated_frame * 255).astype(np.uint8)
+        
         out.write(cv2.cvtColor(generated_frame, cv2.COLOR_RGB2BGR))
 
     cap.release()
